@@ -1,0 +1,68 @@
+# --- Local reference files not part of the GitOps source of truth ---
+# Personal notes, one-off scripts, and manifests that predate the ArgoCD flow.
+steps.md
+eksinstall.sh
+FalconDeploymentMixedAutoUpdate.yaml
+
+# Inputs file consumed by eksinstall.sh — contains FALCON_CLIENT_ID / SECRET
+# and AWS_PROFILE. Never commit.
+eks_mixed_operator_inputs*.txt
+
+# --- Secrets and credentials ---
+# GitOps repo should never carry raw credentials. Use GitHub Actions secrets,
+# External Secrets Operator, or Sealed Secrets instead.
+*.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials
+secrets.yaml
+secret-*.yaml
+*-secret.yaml
+*.dec.yaml        # decrypted sops output
+
+# --- Kube / cloud tooling artefacts ---
+kubeconfig
+*.kubeconfig
+.kube/
+.aws/
+.awsconfig
+
+# --- Terraform (if you add IaC later) ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# --- Helm ---
+charts/*.tgz
+.helm/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- macOS / Windows / Linux OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Misc ---
+*.bak
+*.orig
+*.log
+tmp/
+.tmp/

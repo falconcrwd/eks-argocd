@@ -1,5 +1,0 @@
-# clusters/cluster-b/falcon-operator/namespace.yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: falcon-operator
