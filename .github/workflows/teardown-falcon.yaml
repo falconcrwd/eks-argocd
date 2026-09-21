@@ -138,20 +138,61 @@ jobs:
       - name: Wait for operator to finalize child resources
         run: |
           set -euo pipefail
-          # Operator uses finalizers to reap child DaemonSets/Deployments/
-          # webhooks/injectors before the CR fully disappears. Give it up to
-          # 5 minutes to clean up before we tear the operator itself down.
+          # Deleting the FalconDeployment triggers the operator to cascade-
+          # delete every child kind it owns. We must wait for ALL of them —
+          # not just the parent — because the release manifest we delete next
+          # includes the CRDs, and Kubernetes refuses to delete a CRD while
+          # any instance with a finalizer still exists.
+          KINDS="falcondeployment falconnodesensor falconcontainer falconadmission falconimageanalyzer"
           for i in $(seq 1 60); do
-            REMAINING=$(kubectl --context "$EKS_CLUSTER" get falcondeployment -A \
-              -o name 2>/dev/null | wc -l | tr -d ' ')
-            if [ "$REMAINING" = "0" ]; then
-              echo "all FalconDeployments have been finalized"
+            TOTAL=0
+            for kind in $KINDS; do
+              # `2>/dev/null || true` handles the case where a CRD has already
+              # been removed by an earlier iteration.
+              N=$(kubectl --context "$EKS_CLUSTER" get "$kind" -A -o name 2>/dev/null | wc -l | tr -d ' ')
+              TOTAL=$((TOTAL + N))
+            done
+            if [ "$TOTAL" = "0" ]; then
+              echo "all Falcon CRs across all kinds have been finalized"
               exit 0
             fi
-            echo "waiting on $REMAINING FalconDeployment(s) to finalize..."
+            echo "waiting on $TOTAL Falcon CR(s) across $KINDS to finalize..."
             sleep 5
           done
-          echo "FalconDeployments still present after timeout; continuing anyway" >&2
+          echo "Falcon CRs still present after timeout; force-clear step will handle stragglers" >&2
+
+      - name: Force-clear finalizers on any straggler Falcon CRs
+        run: |
+          set -euo pipefail
+          # Safety net for the classic operator-teardown deadlock: if the
+          # operator's controller-manager Deployment goes away before it
+          # finishes finalizing every child CR, those CRs sit with
+          # deletionTimestamp set but finalizers still populated — and then
+          # the CRD delete in the next step blocks forever waiting on them.
+          # Patching finalizers to [] lets the garbage collector reap them.
+          KINDS="falcondeployment falconnodesensor falconcontainer falconadmission falconimageanalyzer"
+          for kind in $KINDS; do
+            kubectl --context "$EKS_CLUSTER" get "$kind" -A \
+              -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+            | while IFS='|' read -r ns name; do
+                [ -z "$name" ] && continue
+                echo "clearing finalizers on $kind $ns/$name"
+                kubectl --context "$EKS_CLUSTER" -n "$ns" patch "$kind" "$name" \
+                  --type=merge -p '{"metadata":{"finalizers":[]}}' \
+                  --ignore-not-found=true || true
+              done
+          done
+          # Brief grace period so the API server can actually delete the objects
+          # whose finalizers we just cleared before we ask for the CRD deletion.
+          for i in $(seq 1 12); do
+            TOTAL=0
+            for kind in $KINDS; do
+              N=$(kubectl --context "$EKS_CLUSTER" get "$kind" -A -o name 2>/dev/null | wc -l | tr -d ' ')
+              TOTAL=$((TOTAL + N))
+            done
+            [ "$TOTAL" = "0" ] && break
+            sleep 5
+          done
 
       - name: Delete Falcon Operator manifest
         run: |
