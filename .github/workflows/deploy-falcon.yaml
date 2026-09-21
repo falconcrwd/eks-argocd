@@ -1,0 +1,235 @@
+name: Deploy Falcon to EKS via ArgoCD
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Git revision (branch, tag, or SHA) for the ArgoCD Application'
+        required: false
+        default: 'main'
+      force_sync:
+        description: 'Trigger argocd app sync + wait after create/update'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      install_operator:
+        description: 'Install/upgrade the Falcon Operator on jwong08-eks-cluster before syncing the app'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      falcon_operator_version:
+        description: 'Falcon Operator release tag (e.g. v1.5.0). Leave as "latest" for the latest release.'
+        required: false
+        default: 'latest'
+      create_secret:
+        description: 'Create/refresh the falcon-secret/falcon-secrets Secret on jwong08-eks-cluster from repo secrets FALCON_CLIENT_ID / FALCON_CLIENT_SECRET'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ARGO_CLUSTER: jwong08-argo-cluster
+  EKS_CLUSTER: jwong08-eks-cluster
+  APP_NAME: falcon-operator
+  APP_PATH: clusters/jwong08-eks-cluster/falcon-operator
+  REPO_URL: https://github.com/falconcrwd/eks-argocd
+  DEST_NAMESPACE: default
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install argocd CLI
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Update kubeconfig for ArgoCD cluster
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --name "$ARGO_CLUSTER" \
+            --region "$AWS_REGION" \
+            --alias argo
+          kubectl config use-context argo
+          kubectl get ns argocd
+
+      - name: Port-forward argocd-server
+        run: |
+          set -euo pipefail
+          kubectl port-forward svc/argocd-server -n argocd 8080:443 \
+            > /tmp/argocd-pf.log 2>&1 &
+          echo "PF_PID=$!" >> "$GITHUB_ENV"
+          # Wait for the port-forward to accept connections
+          for i in $(seq 1 30); do
+            if nc -z localhost 8080; then
+              echo "argocd-server port-forward is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "port-forward did not come up in time" >&2
+          cat /tmp/argocd-pf.log >&2 || true
+          exit 1
+
+      - name: Log in to ArgoCD
+        run: |
+          set -euo pipefail
+          PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+            -o jsonpath='{.data.password}' | base64 -d)
+          echo "::add-mask::$PW"
+          argocd login localhost:8080 \
+            --username admin \
+            --password "$PW" \
+            --insecure \
+            --grpc-web
+          argocd account get-user-info
+
+      - name: Register jwong08-eks-cluster with ArgoCD (idempotent)
+        run: |
+          set -euo pipefail
+          # argocd cluster add reads the kubeconfig context of this name.
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER" \
+            --region "$AWS_REGION" \
+            --alias "$EKS_CLUSTER"
+
+          # Switch back to the argo cluster context so kubectl port-forward
+          # target still resolves; argocd CLI takes the target via --context.
+          kubectl config use-context argo
+
+          if argocd cluster list -o json \
+              | jq -e --arg n "$EKS_CLUSTER" '.[] | select(.name==$n)' > /dev/null; then
+            echo "cluster $EKS_CLUSTER already registered"
+          else
+            echo "registering $EKS_CLUSTER with ArgoCD"
+            argocd cluster add "$EKS_CLUSTER" \
+              --name "$EKS_CLUSTER" \
+              --yes
+          fi
+
+          DEST_SERVER=$(argocd cluster list -o json \
+            | jq -r --arg n "$EKS_CLUSTER" '.[] | select(.name==$n) | .server')
+          if [ -z "$DEST_SERVER" ] || [ "$DEST_SERVER" = "null" ]; then
+            echo "failed to resolve destination server for $EKS_CLUSTER" >&2
+            exit 1
+          fi
+          echo "DEST_SERVER=$DEST_SERVER" >> "$GITHUB_ENV"
+
+      - name: Install Falcon Operator on jwong08-eks-cluster
+        if: ${{ inputs.install_operator == 'true' }}
+        run: |
+          set -euo pipefail
+          VERSION='${{ inputs.falcon_operator_version }}'
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            URL="https://github.com/crowdstrike/falcon-operator/releases/latest/download/falcon-operator.yaml"
+          else
+            URL="https://github.com/crowdstrike/falcon-operator/releases/download/${VERSION}/falcon-operator.yaml"
+          fi
+          echo "applying $URL"
+          kubectl --context "$EKS_CLUSTER" apply -f "$URL"
+
+      - name: Wait for FalconDeployment CRD
+        if: ${{ inputs.install_operator == 'true' }}
+        run: |
+          set -euo pipefail
+          # CRD may take a moment to appear after the operator manifest applies.
+          for i in $(seq 1 30); do
+            if kubectl --context "$EKS_CLUSTER" get crd \
+                 falcondeployments.falcon.crowdstrike.com > /dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          kubectl --context "$EKS_CLUSTER" wait \
+            --for=condition=established \
+            --timeout=120s \
+            crd/falcondeployments.falcon.crowdstrike.com
+
+      - name: Create/refresh Falcon secret on jwong08-eks-cluster
+        if: ${{ inputs.create_secret == 'true' }}
+        env:
+          FALCON_CLIENT_ID: ${{ secrets.FALCON_CLIENT_ID }}
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FALCON_CLIENT_ID:-}" ] || [ -z "${FALCON_CLIENT_SECRET:-}" ]; then
+            echo "FALCON_CLIENT_ID / FALCON_CLIENT_SECRET repo secrets are not set" >&2
+            exit 1
+          fi
+          kubectl --context "$EKS_CLUSTER" create namespace falcon-secret \
+            --dry-run=client -o yaml | kubectl --context "$EKS_CLUSTER" apply -f -
+          kubectl --context "$EKS_CLUSTER" create secret generic falcon-secrets \
+            -n falcon-secret \
+            --from-literal=falcon-client-id="$FALCON_CLIENT_ID" \
+            --from-literal=falcon-client-secret="$FALCON_CLIENT_SECRET" \
+            --dry-run=client -o yaml | kubectl --context "$EKS_CLUSTER" apply -f -
+
+      - name: Create or update ArgoCD Application
+        run: |
+          set -euo pipefail
+          if argocd app get "$APP_NAME" > /dev/null 2>&1; then
+            echo "updating existing app $APP_NAME"
+            argocd app set "$APP_NAME" \
+              --repo "$REPO_URL" \
+              --path "$APP_PATH" \
+              --dest-server "$DEST_SERVER" \
+              --dest-namespace "$DEST_NAMESPACE" \
+              --revision "${{ inputs.revision }}" \
+              --sync-policy automated \
+              --auto-prune \
+              --self-heal
+          else
+            echo "creating app $APP_NAME"
+            argocd app create "$APP_NAME" \
+              --repo "$REPO_URL" \
+              --path "$APP_PATH" \
+              --dest-server "$DEST_SERVER" \
+              --dest-namespace "$DEST_NAMESPACE" \
+              --revision "${{ inputs.revision }}" \
+              --sync-policy automated \
+              --auto-prune \
+              --self-heal \
+              --sync-option CreateNamespace=true
+          fi
+          argocd app get "$APP_NAME"
+
+      - name: Sync and wait
+        if: ${{ inputs.force_sync == 'true' }}
+        run: |
+          set -euo pipefail
+          argocd app sync "$APP_NAME"
+          argocd app wait "$APP_NAME" --sync --health --timeout 600
+
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -n "${PF_PID:-}" ]; then
+            kill "$PF_PID" 2>/dev/null || true
+          fi

@@ -1,0 +1,192 @@
+name: Teardown Falcon from EKS via ArgoCD
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DELETE to confirm teardown of Falcon from jwong08-eks-cluster'
+        required: true
+        default: ''
+      falcon_operator_version:
+        description: 'Falcon Operator release tag to uninstall (e.g. v1.5.0). Use "latest" if installed via latest.'
+        required: false
+        default: 'latest'
+      remove_secret:
+        description: 'Also delete the falcon-secret namespace + falcon-secrets Secret'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      unregister_cluster:
+        description: 'Remove jwong08-eks-cluster from ArgoCD after teardown'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ARGO_CLUSTER: jwong08-argo-cluster
+  EKS_CLUSTER: jwong08-eks-cluster
+  APP_NAME: falcon-operator
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm intent
+        if: ${{ inputs.confirm != 'DELETE' }}
+        run: |
+          echo 'Refusing to run: set the "confirm" input to the exact string DELETE.' >&2
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install argocd CLI
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Update kubeconfigs for both clusters
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$ARGO_CLUSTER" --region "$AWS_REGION" --alias argo
+          aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION" --alias "$EKS_CLUSTER"
+          kubectl config use-context argo
+          kubectl get ns argocd
+
+      - name: Port-forward argocd-server
+        run: |
+          set -euo pipefail
+          kubectl port-forward svc/argocd-server -n argocd 8080:443 \
+            > /tmp/argocd-pf.log 2>&1 &
+          echo "PF_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            if nc -z localhost 8080; then
+              echo "argocd-server port-forward is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "port-forward did not come up in time" >&2
+          cat /tmp/argocd-pf.log >&2 || true
+          exit 1
+
+      - name: Log in to ArgoCD
+        run: |
+          set -euo pipefail
+          PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+            -o jsonpath='{.data.password}' | base64 -d)
+          printf '::add-mask::%s\n' "$PW"
+          argocd login localhost:8080 \
+            --username admin \
+            --password "$PW" \
+            --insecure \
+            --grpc-web
+
+      - name: Delete ArgoCD Application (stops auto-sync immediately)
+        run: |
+          set -euo pipefail
+          if argocd app get "$APP_NAME" > /dev/null 2>&1; then
+            # --cascade=false so ArgoCD only removes the Application resource
+            # itself and does NOT delete the tracked CR — we handle CR/operator
+            # deletion explicitly below in a controlled order.
+            argocd app delete "$APP_NAME" --cascade=false --yes
+          else
+            echo "ArgoCD Application '$APP_NAME' does not exist; skipping"
+          fi
+
+      - name: Delete FalconDeployment CRs across all namespaces
+        run: |
+          set -euo pipefail
+          if ! kubectl --context "$EKS_CLUSTER" get crd \
+                falcondeployments.falcon.crowdstrike.com > /dev/null 2>&1; then
+            echo "FalconDeployment CRD not present; nothing to delete"
+            exit 0
+          fi
+          NAMESPACES=$(kubectl --context "$EKS_CLUSTER" get falcondeployment -A \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' \
+            | sort -u)
+          if [ -z "$NAMESPACES" ]; then
+            echo "no FalconDeployment resources found"
+            exit 0
+          fi
+          for ns in $NAMESPACES; do
+            echo "deleting FalconDeployments in namespace $ns"
+            kubectl --context "$EKS_CLUSTER" -n "$ns" \
+              delete falcondeployment --all --ignore-not-found
+          done
+
+      - name: Wait for operator to finalize child resources
+        run: |
+          set -euo pipefail
+          # Operator uses finalizers to reap child DaemonSets/Deployments/
+          # webhooks/injectors before the CR fully disappears. Give it up to
+          # 5 minutes to clean up before we tear the operator itself down.
+          for i in $(seq 1 60); do
+            REMAINING=$(kubectl --context "$EKS_CLUSTER" get falcondeployment -A \
+              -o name 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$REMAINING" = "0" ]; then
+              echo "all FalconDeployments have been finalized"
+              exit 0
+            fi
+            echo "waiting on $REMAINING FalconDeployment(s) to finalize..."
+            sleep 5
+          done
+          echo "FalconDeployments still present after timeout; continuing anyway" >&2
+
+      - name: Delete Falcon Operator manifest
+        run: |
+          set -euo pipefail
+          VERSION='${{ inputs.falcon_operator_version }}'
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            URL="https://github.com/crowdstrike/falcon-operator/releases/latest/download/falcon-operator.yaml"
+          else
+            URL="https://github.com/crowdstrike/falcon-operator/releases/download/${VERSION}/falcon-operator.yaml"
+          fi
+          echo "deleting $URL"
+          kubectl --context "$EKS_CLUSTER" delete -f "$URL" --ignore-not-found
+
+      - name: Delete falcon-secret namespace
+        if: ${{ inputs.remove_secret == 'true' }}
+        run: |
+          set -euo pipefail
+          kubectl --context "$EKS_CLUSTER" delete namespace falcon-secret --ignore-not-found
+
+      - name: Remove jwong08-eks-cluster from ArgoCD
+        if: ${{ inputs.unregister_cluster == 'true' }}
+        run: |
+          set -euo pipefail
+          SERVER=$(argocd cluster list -o json \
+            | jq -r --arg n "$EKS_CLUSTER" '.[] | select(.name==$n) | .server')
+          if [ -z "$SERVER" ] || [ "$SERVER" = "null" ]; then
+            echo "cluster $EKS_CLUSTER not registered in ArgoCD; skipping"
+            exit 0
+          fi
+          echo "removing $SERVER from ArgoCD"
+          argocd cluster rm "$SERVER" --yes
+
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -n "${PF_PID:-}" ]; then
+            kill "$PF_PID" 2>/dev/null || true
+          fi
