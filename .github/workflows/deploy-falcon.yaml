@@ -41,7 +41,7 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-west-2
   ARGO_CLUSTER: jwong08-argo-cluster
   EKS_CLUSTER: jwong08-eks-cluster
   APP_NAME: falcon-operator
