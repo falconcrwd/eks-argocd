@@ -1,0 +1,92 @@
+apiVersion: falcon.crowdstrike.com/v1alpha1
+kind: FalconDeployment
+metadata:
+  labels:
+    crowdstrike.com/component: sample
+    crowdstrike.com/created-by: falcon-operator
+    crowdstrike.com/instance: falcondeployment-sample
+    crowdstrike.com/managed-by: kustomize
+    crowdstrike.com/name: falcon-deployment
+    crowdstrike.com/part-of: Falcon
+    crowdstrike.com/provider: crowdstrike
+  name: falcon-deployment
+spec:
+  # falcon_api is REQUIRED for auto-update to work for BOTH the Node Sensor
+  # (falconnodesensor_controller.go:1135) and the Container Sensor sidecar
+  # (falconcontainer_controller.go:400). The operator returns false from
+  # shouldTrackSensorVersions if Spec.FalconAPI is nil, even with autoUpdate set.
+  falcon_api:
+    cloud_region: autodiscover
+  falconSecret:
+    enabled: true
+    namespace: falcon-secret
+    secretName: falcon-secrets
+  # Mixed EKS cluster (EC2 node pools + Fargate):
+  #   - Node Sensor (DaemonSet) protects EC2 nodes
+  #   - Container Sensor (sidecar injector) protects pods scheduled on Fargate
+  #   - KAC (admission controller) and IAR (image analyzer) run on EC2 nodes
+  #     (their namespaces are intentionally NOT covered by a Fargate profile)
+  deployAdmissionController: true
+  deployNodeSensor: true
+  deployImageAnalyzer: true
+  deployContainerSensor: true
+  falconNodeSensor:
+    # Sensor grouping tags for the Node Sensor. These are user-defined
+    # identifiers surfaced in the Falcon console for grouping/filtering
+    # hosts. Allowed characters: alphanumerics, '/', '-', and '_'.
+    # (api/falcon/v1alpha1/falcon.go: Tags []string)
+    falcon:
+      tags:
+        - eks-mixed-prod
+        - team/platform
+        - env-production
+    node:
+      # No image: field. The operator resolves the sensor image from
+      # registry.crowdstrike.com using the Falcon API credentials and the
+      # linux-prod sensor update policy. A pinned image would disable auto-update.
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+          key: CriticalAddonsOnly
+      advanced:
+        autoUpdate: normal
+        updatePolicy: linux-prod
+  falconContainerSensor:
+    # Sensor grouping tags for the Container Sensor (Fargate sidecar).
+    # Same field/format as the Node Sensor; kept in sync so both sensor
+    # types report the same grouping tags for this cluster.
+    falcon:
+      tags:
+        - eks-mixed-prod
+        - team/platform
+        - env-production
+    # Use a dedicated namespace for the Fargate sidecar injector so it does not
+    # collide with the FalconNodeSensor's default falcon-system namespace and
+    # so the Fargate profile can target it specifically.
+    installNamespace: falcon-injector
+    # No image: field. The operator resolves the container sensor image from
+    # registry.crowdstrike.com using the Falcon API credentials and the
+    # linux-prod sensor update policy.
+    #
+    # No injector.serviceAccount.annotations either: the operator generates a
+    # dockerconfigjson pull secret from the Falcon API credentials, so the
+    # injector pod on Fargate pulls directly from registry.crowdstrike.com
+    # without IRSA.
+    advanced:
+      autoUpdate: normal
+      updatePolicy: linux-prod
+  # No image: field for IAR or KAC. The operator resolves and pulls these from
+  # registry.crowdstrike.com on every reconcile, so no ECR mirroring is needed
+  # and the EC2 node IAM role does not need ECR permissions.
+  falconImageAnalyzer: {}
+  falconAdmission:
+    # Sensor grouping tags for the Kubernetes Admission Controller (KAC).
+    # FalconAdmissionSpec embeds the same FalconSensor struct as the Node
+    # and Container sensors (api/falcon/v1alpha1/falconadmission_types.go: Falcon FalconSensor),
+    # so KAC accepts the same falcon.tags field. Kept in sync with the
+    # other sensors for consistent grouping/filtering in the console.
+    falcon:
+      tags:
+        - eks-mixed-prod
+        - team/platform
+        - env-production

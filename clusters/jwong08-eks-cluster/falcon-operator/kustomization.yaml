@@ -1,0 +1,6 @@
+# clusters/cluster-b/falcon-operator/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - manifests/namespace.yaml
+  - manifests/falcon-operator.yaml  # Your existing manifest
