@@ -114,26 +114,28 @@ jobs:
             echo "ArgoCD Application '$APP_NAME' does not exist; skipping"
           fi
 
-      - name: Delete FalconDeployment CRs across all namespaces
+      - name: Delete FalconDeployment CRs
         run: |
           set -euo pipefail
+          # FalconDeployment is a CLUSTER-scoped CRD, so `-A` / per-namespace
+          # enumeration doesn't apply — just list and delete at the cluster
+          # scope. (Earlier versions of this workflow filtered by
+          # .metadata.namespace, which is always empty for cluster-scoped
+          # objects and made the step falsely report "none found".)
           if ! kubectl --context "$EKS_CLUSTER" get crd \
                 falcondeployments.falcon.crowdstrike.com > /dev/null 2>&1; then
             echo "FalconDeployment CRD not present; nothing to delete"
             exit 0
           fi
-          NAMESPACES=$(kubectl --context "$EKS_CLUSTER" get falcondeployment -A \
-            -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' \
-            | sort -u)
-          if [ -z "$NAMESPACES" ]; then
+          NAMES=$(kubectl --context "$EKS_CLUSTER" get falcondeployment \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+          if [ -z "$NAMES" ]; then
             echo "no FalconDeployment resources found"
             exit 0
           fi
-          for ns in $NAMESPACES; do
-            echo "deleting FalconDeployments in namespace $ns"
-            kubectl --context "$EKS_CLUSTER" -n "$ns" \
-              delete falcondeployment --all --ignore-not-found
-          done
+          echo "found FalconDeployment(s):"
+          echo "$NAMES"
+          kubectl --context "$EKS_CLUSTER" delete falcondeployment --all --ignore-not-found
 
       - name: Wait for operator to finalize child resources
         run: |
