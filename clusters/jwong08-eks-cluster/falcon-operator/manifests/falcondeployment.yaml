@@ -40,7 +40,6 @@ spec:
         - eks-mixed-prod
         - team/platform
         - env-production
-        - demotags
     node:
       # No image: field. The operator resolves the sensor image from
       # registry.crowdstrike.com using the Falcon API credentials and the
@@ -61,7 +60,6 @@ spec:
         - eks-mixed-prod
         - team/platform
         - env-production
-        - demotags
     # Use a dedicated namespace for the Fargate sidecar injector so it does not
     # collide with the FalconNodeSensor's default falcon-system namespace and
     # so the Fargate profile can target it specifically.
@@ -92,4 +90,3 @@ spec:
         - eks-mixed-prod
         - team/platform
         - env-production
-        - demotags
