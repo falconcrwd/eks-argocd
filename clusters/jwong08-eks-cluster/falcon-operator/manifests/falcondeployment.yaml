@@ -89,4 +89,4 @@ spec:
       tags:
         - eks-mixed-prod
         - team/platform
-        - env-production
+        - snoopy
