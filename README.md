@@ -17,6 +17,7 @@ This repository is a GitOps source of truth for deploying CrowdStrike's **Falcon
   - [8. CrowdStrike Falcon — API client + sensor update policy](#8-crowdstrike-falcon--api-client-scopes-and-sensor-update-policy)
 - [Running the workflows](#running-the-workflows)
 - [Day-to-day GitOps flow](#day-to-day-gitops-flow)
+- [Verifying ArgoCD sync status and logs](#verifying-argocd-sync-status-and-logs)
 - [Teardown](#teardown)
 - [Troubleshooting](#troubleshooting)
 
@@ -310,6 +311,110 @@ Things that **do not** auto-update and still need a workflow run:
 - Rotating Falcon API credentials (`create_secret: true` with new secret values in GitHub)
 - Changing the ArgoCD Application spec itself (repo URL, path, destination namespace)
 - Adding another target cluster
+
+## Verifying ArgoCD sync status and logs
+
+All commands below run from a workstation with kube contexts for both clusters. Substitute your local context names if they differ (e.g. the full `arn:aws:eks:...:cluster/<name>` ARN that `aws eks update-kubeconfig` creates by default).
+
+### Sync status with `kubectl` (no ArgoCD login needed)
+
+The ArgoCD `Application` is a regular CR in the `argocd` namespace on cluster A:
+
+```bash
+# Sync / health summary for every app
+kubectl --context jwong08-argo-cluster -n argocd get applications
+
+# One-line status: sync / health @ deployed Git revision
+kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator \
+  -o jsonpath='{.status.sync.status}{" / "}{.status.health.status}{" @ "}{.status.sync.revision}{"\n"}'
+
+# Per-resource status (should be FalconDeployment/falcon-deployment  Synced)
+kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+  | jq -r '.status.resources[] | "\(.kind)/\(.name)  \(.status)  \(.health.status // "-")"'
+
+# Result of the last sync operation
+kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+  | jq -r '.status.operationState | "\(.phase)  \(.finishedAt)  \(.message)"'
+
+# Error conditions (ComparisonError, SyncError, ...) — empty output means none
+kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+  | jq -r '.status.conditions // [] | .[] | "\(.type): \(.message)"'
+
+# Recent sync history (id, time, short SHA)
+kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+  | jq -r '.status.history[-5:][] | "\(.id)  \(.deployedAt)  \(.revision[0:7])"'
+
+# Event timeline: OutOfSync -> sync started -> succeeded/failed
+kubectl --context jwong08-argo-cluster -n argocd get events \
+  --field-selector involvedObject.name=falcon-operator --sort-by=.lastTimestamp
+```
+
+A healthy state is `Synced / Healthy` at the SHA of the latest commit on `main` (`git rev-parse origin/main`). If the revision lags behind `main`, ArgoCD hasn't polled yet — force a refresh (below).
+
+### Sync status with the `argocd` CLI
+
+Log in the same way the workflow does:
+
+```bash
+kubectl --context jwong08-argo-cluster -n argocd port-forward svc/argocd-server 8080:443 &
+argocd login localhost:8080 --username admin --insecure \
+  --password "$(kubectl --context jwong08-argo-cluster -n argocd get secret argocd-initial-admin-secret \
+                -o jsonpath='{.data.password}' | base64 -d)"
+```
+
+Then:
+
+```bash
+argocd app list                                    # all apps, sync + health
+argocd app get falcon-operator                     # summary, conditions, per-resource status
+argocd app get falcon-operator --refresh           # re-poll Git now instead of waiting ~3 min
+argocd app diff falcon-operator                    # Git vs live; no output = in sync
+argocd app history falcon-operator                 # deployed revisions
+argocd app wait falcon-operator --sync --health --timeout 300
+```
+
+### ArgoCD component logs
+
+ArgoCD logs in JSON, so filter on the `application` field or the `level` field:
+
+```bash
+# Application controller — reconciliation, auto-sync, and apply errors for this app
+kubectl --context jwong08-argo-cluster -n argocd logs statefulset/argocd-application-controller --since=1h \
+  | grep '"application":"falcon-operator"'
+
+# Warnings/errors only
+kubectl --context jwong08-argo-cluster -n argocd logs statefulset/argocd-application-controller --since=24h \
+  | grep -E '"level":"(warning|error)"'
+
+# Repo server — Git fetch and kustomize build errors (filters out health-check noise)
+kubectl --context jwong08-argo-cluster -n argocd logs deploy/argocd-repo-server -c argocd-repo-server --since=1h \
+  | grep -v 'grpc.health.v1.Health'
+
+# API server — CLI/UI requests and auth errors
+kubectl --context jwong08-argo-cluster -n argocd logs deploy/argocd-server --since=1h \
+  | grep -E '"level":"(warning|error)"'
+
+# All ArgoCD pods running?
+kubectl --context jwong08-argo-cluster -n argocd get pods
+```
+
+A one-off `"level":"warning"` with `another operation is already in progress` during a burst of commits is benign — ArgoCD retries on the next reconcile.
+
+### Confirming the change reached the sensors
+
+`Synced` only means the `FalconDeployment` CR on cluster B matches Git. To confirm the operator propagated it, compare the CR and what the running sensor reports (sensor grouping tags as the example):
+
+```bash
+# What ArgoCD applied
+kubectl --context jwong08-eks-cluster get falcondeployment falcon-deployment -o json \
+  | jq '{node: .spec.falconNodeSensor.falcon.tags, container: .spec.falconContainerSensor.falcon.tags, kac: .spec.falconAdmission.falcon.tags}'
+
+# What the Node Sensor is actually running with (falconctl is not on PATH)
+kubectl --context jwong08-eks-cluster -n falcon-system exec ds/falcon-node-sensor -c falcon-node-sensor -- \
+  /opt/CrowdStrike/falconctl -g --tags
+```
+
+If the CR is right but the sensor isn't, see the operator log at the end of [Troubleshooting](#troubleshooting). If the CR itself is wrong, the problem is in Git: check which block of `falcondeployment.yaml` you edited, since each sensor type has its own `falcon.tags` list.
 
 ## Teardown
 
