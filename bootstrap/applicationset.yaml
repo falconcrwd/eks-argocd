@@ -6,6 +6,12 @@
 # workflow removes it, which makes the ApplicationSet delete that cluster's
 # Applications without touching the other clusters.
 #
+# Each cluster's Applications deploy the Git revision in the cluster Secret's
+# eks-argocd/revision annotation (set by the deploy workflow's `revision`
+# input), or main if it is unset. Cluster directories are always discovered
+# from main, so a new cluster's directory must be merged before it gets an
+# Application.
+#
 # Applied by .github/workflows/deploy-falcon.yaml; not synced by ArgoCD itself.
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
@@ -34,7 +40,10 @@ spec:
       project: default
       source:
         repoURL: https://github.com/falconcrwd/eks-argocd
-        targetRevision: main
+        # metadata.annotations["eks-argocd/revision"] of the cluster Secret, else main.
+        # Written defensively: under missingkey=error, a cluster Secret with no
+        # annotations would otherwise fail generation for every cluster.
+        targetRevision: '{{ $m := index . "metadata" | default dict }}{{ $a := index $m "annotations" | default dict }}{{ index $a "eks-argocd/revision" | default "main" }}'
         path: '{{.path.path}}'
       destination:
         server: '{{.server}}'
