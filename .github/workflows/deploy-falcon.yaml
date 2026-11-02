@@ -276,10 +276,27 @@ jobs:
         if: ${{ inputs.force_sync == 'true' }}
         run: |
           set -euo pipefail
-          # A freshly generated Application starts its first auto-sync right
-          # away; let that finish so the manual sync doesn't collide with it.
-          argocd app wait "$APP_NAME" --operation --timeout 300
-          argocd app sync "$APP_NAME"
+          # Automated sync can start an operation at any moment — e.g. a
+          # freshly generated Application whose first auto-sync begins a second
+          # or two after it appears, after `app wait --operation` has already
+          # returned. Retry the manual sync while that operation runs.
+          for i in $(seq 1 12); do
+            argocd app wait "$APP_NAME" --operation --timeout 300
+            if OUT=$(argocd app sync "$APP_NAME" 2>&1); then
+              echo "$OUT"
+              break
+            fi
+            if ! grep -q 'another operation is already in progress' <<< "$OUT"; then
+              echo "$OUT" >&2
+              exit 1
+            fi
+            if [ "$i" -eq 12 ]; then
+              echo "an operation was still in progress after $i attempts" >&2
+              exit 1
+            fi
+            echo "another operation is in progress; retrying ($i/12)"
+            sleep 5
+          done
           argocd app wait "$APP_NAME" --sync --health --timeout 600
 
       - name: Stop port-forward
