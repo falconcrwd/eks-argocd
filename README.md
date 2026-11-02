@@ -1,10 +1,12 @@
 # eks-argocd — Falcon Operator on EKS via ArgoCD
 
-This repository is a GitOps source of truth for deploying CrowdStrike's **Falcon Operator** and its `FalconDeployment` custom resource into an EKS cluster (`jwong08-eks-cluster`, "cluster B") from another EKS cluster running ArgoCD (`jwong08-argo-cluster`, "cluster A"). Two `workflow_dispatch` GitHub Actions workflows automate the bootstrap and teardown; day-to-day changes to sensor config are pure GitOps — commit to `main`, walk away.
+This repository is a GitOps source of truth for deploying CrowdStrike's **Falcon Operator** and its `FalconDeployment` custom resource into EKS workload clusters (currently `jwong08-eks-cluster`, "cluster B") from another EKS cluster running ArgoCD (`jwong08-argo-cluster`, "cluster A"). Two `workflow_dispatch` GitHub Actions workflows automate the bootstrap and teardown of any one workload cluster at a time (`eks_cluster` input); day-to-day changes to sensor config are pure GitOps — commit to `main`, walk away.
 
 ## Table of contents
 
 - [Architecture](#architecture)
+  - [ApplicationSet](#applicationset)
+  - [What the workflows do, and what stays manual](#what-the-workflows-do-and-what-stays-manual)
 - [Repository layout](#repository-layout)
 - [Prerequisites](#prerequisites)
   - [1. GitHub repository secrets](#1-github-repository-secrets)
@@ -48,12 +50,14 @@ This repository is a GitOps source of truth for deploying CrowdStrike's **Falcon
                                             └─────────────────────────────────┘
 ```
 
-**Cluster A** hosts ArgoCD. It watches this repo and syncs the `FalconDeployment` CR into cluster B. **Cluster B** is the workload cluster where the Falcon Operator and the sensors actually run.
+**Cluster A** hosts ArgoCD. It watches this repo and syncs the `FalconDeployment` CR into cluster B. **Cluster B** is the workload cluster where the Falcon Operator and the sensors actually run. More workload clusters can be added the same way; see [Adding another target cluster](#adding-another-target-cluster).
 
-Two workflows live in `.github/workflows/`:
+Two workflows live in `.github/workflows/`. Both act on the one workload cluster named by their `eks_cluster` input (default `jwong08-eks-cluster`) and leave other clusters alone:
 
-- **`deploy-falcon.yaml`** — bootstraps and re-syncs: installs the Falcon Operator on cluster B, creates the `falcon-secrets` Secret on first run, registers cluster B with ArgoCD, applies the `eks-argocd` ApplicationSet, and opts cluster B into it so ArgoCD generates the `jwong08-eks-cluster-falcon-operator` Application.
-- **`teardown-falcon.yaml`** — reverses the above: opts cluster B out of the ApplicationSet (which removes its Application), deletes the `FalconDeployment` CR (letting the operator reap child workloads via finalizers), deletes the operator manifest, and unregisters cluster B from ArgoCD.
+- **`deploy-falcon.yaml`** — bootstraps and re-syncs: installs the Falcon Operator on the cluster, creates the `falcon-secrets` Secret on first run, registers the cluster with ArgoCD, applies the `eks-argocd` ApplicationSet, and opts the cluster into it at the requested `revision` so ArgoCD generates the `<eks_cluster>-falcon-operator` Application.
+- **`teardown-falcon.yaml`** — reverses the above: opts the cluster out of the ApplicationSet (which removes its Application), deletes the `FalconDeployment` CR (letting the operator reap child workloads via finalizers), deletes the operator manifest, and unregisters the cluster from ArgoCD.
+
+Runs of both workflows share one concurrency group, so they queue rather than overlap.
 
 ### ApplicationSet
 
@@ -65,7 +69,45 @@ clusters/jwong08-eks-cluster/falcon-operator/
   → Application "jwong08-eks-cluster-falcon-operator" → cluster registered as "jwong08-eks-cluster"
 ```
 
-`<cluster-name>` must match the name the cluster is registered under in ArgoCD (`argocd cluster list`). Removing the label, or the directory, deletes that cluster's Application but leaves its resources running (`preserveResourcesOnDeletion: true`); teardown then removes them in operator-safe order.
+- `<cluster-name>` must match the name the cluster is registered under in ArgoCD (`argocd cluster list`).
+- **Revision is per cluster.** Each cluster's Application deploys the Git revision in its cluster Secret's `eks-argocd/revision` annotation, or `main` if unset. The deploy workflow sets it from its `revision` input, so deploying a branch to one cluster doesn't move the others.
+- **Directories are always discovered on `main`.** A cluster's directory must be merged to `main` before it gets an Application, even if that cluster deploys another revision.
+- Removing the label, or the directory, deletes that cluster's Application but leaves its resources running (`preserveResourcesOnDeletion: true`); teardown then removes them in operator-safe order.
+- The ApplicationSet itself is shared and is never deleted by teardown; with no opted-in clusters it simply generates nothing.
+
+To see each cluster's opt-in state and revision:
+
+```bash
+kubectl --context jwong08-argo-cluster -n argocd get secret -l argocd.argoproj.io/secret-type=cluster -o json \
+  | jq -r '.items[] | "\(.data.name | @base64d)  enabled=\(.metadata.labels["eks-argocd/enabled"] // "-")  revision=\(.metadata.annotations["eks-argocd/revision"] // "main (default)")"'
+```
+
+### What the workflows do, and what stays manual
+
+| Task | Done by |
+| --- | --- |
+| Add `clusters/<cluster>/falcon-operator/` and merge it to `main` | **Manual** (PR). Deploy fails early if it's missing on `main`. |
+| Add the cluster's ARN to the runner role's IAM policy ([§3](#3-aws--iam-role-assumed-by-the-workflow)) | **Manual**, once per cluster |
+| Create an EKS access entry for the runner role on the cluster ([§4](#4-aws--eks-access-entries-on-both-clusters)) | **Manual**, once per cluster |
+| Allow ArgoCD's nodes to reach the cluster API on 443 ([§5](#5-aws--security-group-ingress-from-cluster-a-to-cluster-b)) and enable public endpoint access ([§7](#7-cluster-b--api-endpoint-must-be-reachable-by-the-runner)) | **Manual**, once per cluster |
+| Register the cluster with ArgoCD | Deploy |
+| Install / upgrade the Falcon Operator | Deploy (`install_operator`) |
+| Create / rotate the `falcon-secrets` Secret | Deploy (`create_secret`) |
+| Apply the ApplicationSet | Deploy (every run) |
+| Opt the cluster in, at a revision | Deploy (`revision`) |
+| Sync and wait for `Synced / Healthy` | Deploy (`force_sync`) |
+| Ongoing changes to the `FalconDeployment` | ArgoCD, from Git |
+| Opt the cluster out (removes its Application) | Teardown |
+| Delete the `FalconDeployment`, operator, and optionally the Secret | Teardown |
+| Unregister the cluster from ArgoCD | Teardown (`unregister_cluster`) |
+| Remove the cluster's directory from Git | **Manual** (PR), if the cluster is gone for good |
+| Undo the AWS setup (IAM ARN, access entry, SG rule) | **Manual** |
+
+Limits:
+
+- **One AWS region.** `AWS_REGION` is fixed to `us-west-2` in both workflows.
+- **One set of Falcon API credentials** (`FALCON_CLIENT_ID` / `FALCON_CLIENT_SECRET`) is used for every cluster.
+- **One app per cluster.** The workflows wait for and sync `<eks_cluster>-falcon-operator` only. Other directories under `clusters/<cluster>/` still get Applications from the ApplicationSet, but the workflows don't sync or tear them down.
 
 ## Repository layout
 
@@ -93,6 +135,8 @@ Only `falcondeployment.yaml` is managed by ArgoCD. The operator itself, the `fal
 ## Prerequisites
 
 The 8 subsections below are one-time setup. Once all of them are done, running `deploy-falcon.yaml` should succeed end-to-end without any manual intervention.
+
+§3, §4, §5 and §7 are also **per workload cluster**: repeat them for each cluster you add (see [Adding another target cluster](#adding-another-target-cluster)).
 
 ### 1. GitHub repository secrets
 
@@ -147,7 +191,7 @@ The generated trust policy looks like this (scope the `sub` to your org/repo, op
 }
 ```
 
-Attach an inline permissions policy that allows `eks:DescribeCluster` on both clusters (this is what `aws eks update-kubeconfig` calls):
+Attach an inline permissions policy that allows `eks:DescribeCluster` on the ArgoCD cluster and every workload cluster (this is what `aws eks update-kubeconfig` calls). Add one ARN per workload cluster you deploy to:
 
 ```json
 {
@@ -171,7 +215,7 @@ Copy the role's ARN into GitHub secret `AWS_ROLE_TO_ASSUME` (§1).
 
 `eks:DescribeCluster` only opens the AWS API layer. Kubernetes RBAC is a separate authorization plane; you must grant the IAM role Kubernetes permissions on **both** clusters.
 
-For **each** cluster (`jwong08-argo-cluster` and `jwong08-eks-cluster`):
+For **each** cluster (`jwong08-argo-cluster`, `jwong08-eks-cluster`, and any workload cluster you add later):
 
 **EKS → Clusters → `<cluster-name>` → Access → IAM access entries → Create access entry**
 
@@ -218,12 +262,20 @@ Assumed already in place:
 
 - ArgoCD installed in the `argocd` namespace on `jwong08-argo-cluster`.
 - The `argocd-initial-admin-secret` still exists in the `argocd` namespace. The workflow authenticates as `admin` using this password. If you've followed ArgoCD's post-install recommendation to delete it, either recreate the secret or switch the workflow to use a long-lived project token instead.
-- This repository (`https://github.com/<org>/<repo>`) is in ArgoCD's repository list (Settings → Repositories). Public repo → no credentials needed; private → add a deploy key or PAT.
+- This repository (`https://github.com/falconcrwd/eks-argocd`) is in ArgoCD's repository list (Settings → Repositories). It is connected over HTTPS using a **GitHub App** whose only repository permission is **Contents: Read-only** (plus the mandatory Metadata: Read-only), installed on this repository only. ArgoCD can read the manifests but cannot push to the repo or reach any other repository. The App's ID and private key are stored in ArgoCD's repository Secret, not in this repo.
 
 Quick sanity check:
 
 ```bash
 kubectl --context jwong08-argo-cluster -n argocd get secret argocd-initial-admin-secret
+
+# Repo registered via the GitHub App: STATUS should be Successful
+argocd repo get https://github.com/falconcrwd/eks-argocd --refresh hard
+
+# Confirms GitHub App auth (prints field names only, never the key)
+kubectl --context jwong08-argo-cluster -n argocd get secret -l argocd.argoproj.io/secret-type=repository \
+  -o go-template='{{range .items}}{{.data.url | base64decode}}:{{range $k, $v := .data}} {{$k}}{{end}}{{"\n"}}{{end}}'
+# expect: githubAppID githubAppPrivateKey ... (no sshPrivateKey / password)
 ```
 
 ### 7. Cluster B — API endpoint must be reachable by the runner
@@ -282,13 +334,16 @@ If the policy is missing or disabled, the child sensor reconcilers stall at `Req
 
 | Input | First run | Subsequent runs |
 | --- | --- | --- |
-| `revision` | `main` | `main` |
+| `eks_cluster` | `jwong08-eks-cluster` (or another cluster set up per [Adding another target cluster](#adding-another-target-cluster)) | Same cluster |
+| `revision` | `main` | `main`, or a branch / tag / SHA to deploy to **this cluster only** |
 | `force_sync` | `true` | `true` (or `false` if you don't want to wait) |
 | `install_operator` | `true` | `true` (idempotent) or `false` after operator is stable |
 | `falcon_operator_version` | `latest` (or pin to a tag like `v1.5.0`) | Same as first run |
 | **`create_secret`** | **`true`** | **`false`** |
 
 The run takes ~3–5 minutes. Watch it under **Actions**; the `argocd app wait` step should end in `Synced / Healthy`.
+
+Re-running Deploy is safe: registration, operator install, labelling and the ApplicationSet apply are all idempotent, and the existing Application is updated in place (never recreated), so the `FalconDeployment` keeps running.
 
 ### Verify after the run
 
@@ -324,20 +379,23 @@ Things that **do not** auto-update and still need a workflow run:
 
 - Bumping the Falcon Operator version (`falcon_operator_version` input)
 - Rotating Falcon API credentials (`create_secret: true` with new secret values in GitHub)
-- Changing `bootstrap/applicationset.yaml` (repo URL, revision, destination namespace, sync policy) — the workflow re-applies it
+- Changing `bootstrap/applicationset.yaml` (repo URL, destination namespace, sync policy) — the workflow re-applies it
+- Changing which revision a cluster deploys (`revision` input)
+
+> **Clusters on a non-`main` revision don't receive pushes to `main`.** If you deploy a branch to a cluster (`revision: feature/x`), that cluster follows the branch until you run Deploy for it again with `revision: main`. Switching back prunes anything that only existed on the branch.
 
 ### Adding another target cluster
 
-1. Add `clusters/<cluster-name>/falcon-operator/` (copy the existing directory and adjust the CR).
-2. Register the cluster with ArgoCD under that exact name and opt it in:
+One-time manual setup for the new cluster (call it `<cluster>`):
 
-   ```bash
-   argocd cluster add <kube-context> --name <cluster-name> --label eks-argocd/enabled=true
-   ```
+1. **Git:** add `clusters/<cluster>/falcon-operator/` (copy `clusters/jwong08-eks-cluster/falcon-operator/` and adjust the CR, e.g. its sensor tags) and merge it to `main`. The directory name must be exactly the EKS cluster name, lowercase letters, digits and `-` only.
+2. **IAM** ([§3](#3-aws--iam-role-assumed-by-the-workflow)): add `arn:aws:eks:<REGION>:<ACCOUNT_ID>:cluster/<cluster>` to the runner role's inline policy.
+3. **EKS access entry** ([§4](#4-aws--eks-access-entries-on-both-clusters)): grant the runner role cluster-admin on `<cluster>`.
+4. **Network** ([§5](#5-aws--security-group-ingress-from-cluster-a-to-cluster-b), [§7](#7-cluster-b--api-endpoint-must-be-reachable-by-the-runner)): allow TCP 443 from cluster A's node SG to `<cluster>`'s control-plane SG, and enable public endpoint access.
 
-3. Install the Falcon Operator and create the `falcon-secrets` Secret on it. The workflows only handle `jwong08-eks-cluster` (`EKS_CLUSTER`), so do this by hand or with a copy of the workflow.
+Then run **Deploy** with `eks_cluster: <cluster>` and `create_secret: true`. It registers the cluster, installs the operator and Secret, opts the cluster into the ApplicationSet, and waits for `<cluster>-falcon-operator` to be `Synced / Healthy`. Other clusters are not touched.
 
-The ApplicationSet then generates `<cluster-name>-falcon-operator` automatically.
+The cluster must be in `us-west-2` (`AWS_REGION`) and uses the same Falcon API credentials as the others.
 
 ## Verifying ArgoCD sync status and logs
 
@@ -451,21 +509,26 @@ If the CR is right but the sensor isn't, see the operator log at the end of [Tro
 
 | Input | Value |
 | --- | --- |
+| `eks_cluster` | The cluster to tear down (default `jwong08-eks-cluster`). Other clusters are untouched. |
 | `confirm` | **`DELETE`** (exact case, hard guard) |
 | `falcon_operator_version` | Same tag as installed (`latest` if you installed via latest) |
 | `remove_secret` | `false` (or `true` to also delete `falcon-secret` namespace) |
-| `unregister_cluster` | `true` (removes cluster B from ArgoCD's cluster list) |
+| `unregister_cluster` | `true` (removes the cluster from ArgoCD's cluster list) |
 
 The workflow enforces safe ordering:
 
-1. Remove the `eks-argocd/enabled` label from cluster B's ArgoCD cluster Secret → the ApplicationSet deletes the Application (leaving the CR in place), which immediately stops auto-sync so nothing races. Other opted-in clusters are untouched.
-2. `kubectl delete falcondeployment --all` across all namespaces on cluster B → operator's finalizers reap child DaemonSets, Deployments, webhooks.
+1. Remove the `eks-argocd/enabled` label (and the `eks-argocd/revision` annotation) from the cluster's ArgoCD cluster Secret → the ApplicationSet deletes the Application (leaving the CR in place), which immediately stops auto-sync so nothing races. Other opted-in clusters are untouched.
+2. `kubectl delete falcondeployment --all` on the cluster → operator's finalizers reap child DaemonSets, Deployments, webhooks.
 3. Wait up to 5 minutes for finalizers to finish.
 4. `kubectl delete -f https://github.com/crowdstrike/falcon-operator/releases/download/<version>/falcon-operator.yaml` → operator itself and its CRDs are removed.
 5. Optionally delete `falcon-secret` namespace.
-6. `argocd cluster rm` → cluster B unregistered from ArgoCD.
+6. `argocd cluster rm` → the cluster is unregistered from ArgoCD.
 
-Note: the SG ingress rule from §5 is **not** removed by teardown — leave it in place so redeploys don't need a Console click.
+Teardown does **not** remove:
+
+- The shared `eks-argocd` ApplicationSet (it generates nothing for an opted-out cluster). Delete it by hand with `argocd appset delete eks-argocd` only once no cluster uses it.
+- The cluster's `clusters/<cluster>/` directory in Git. It's harmless (no Application is generated without the label) and a later Deploy reuses it; delete it by PR if the cluster is gone for good.
+- The AWS setup from §3, §4 and §5 (IAM ARN, access entry, SG ingress rule). Leave it in place so redeploys don't need a Console click.
 
 ## Troubleshooting
 
@@ -477,7 +540,9 @@ Note: the SG ingress rule from §5 is **not** removed by teardown — leave it i
 | KAC and IAR deploy but no Node Sensor DaemonSet / no Container Sensor injector | The `linux-prod` sensor update policy is missing, disabled, or the API client is missing `Sensor update policies: Read` | Fix in Falcon console (§8), then `kubectl -n falcon-operator rollout restart deploy/falcon-operator-controller-manager` |
 | `FalconNodeSensor` CR shows `Pending: RequirementsNotMet` and operator logs are silent for its controller | Stuck controller work-queue after a scope change | `kubectl -n falcon-operator rollout restart deploy/falcon-operator-controller-manager` |
 | `kubectl get falconnodesensor` shows empty `FALCON SENSOR` column | Sensor image / build hasn't been resolved from the policy — often missing `Sensor Download: Read` scope | Add scope in Falcon console, then restart the operator |
-| Git push doesn't seem to reconcile | Change not on the branch ArgoCD tracks, or automated-sync backed off after a previous failure | `argocd app get jwong08-eks-cluster-falcon-operator --refresh && argocd app diff jwong08-eks-cluster-falcon-operator`; then `argocd app sync jwong08-eks-cluster-falcon-operator` if `OutOfSync` |
+| Git push doesn't seem to reconcile | Change not on the branch ArgoCD tracks (check the cluster's `eks-argocd/revision` annotation, [ApplicationSet](#applicationset)), or automated-sync backed off after a previous failure | `argocd app get jwong08-eks-cluster-falcon-operator --refresh && argocd app diff jwong08-eks-cluster-falcon-operator`; then `argocd app sync jwong08-eks-cluster-falcon-operator` if `OutOfSync` |
+| Deploy fails at "Validate target cluster" with `clusters/<cluster>/falcon-operator/ does not exist on main` | The cluster's directory isn't merged to `main` yet, or its name differs from `eks_cluster` | Merge the directory (named exactly as the EKS cluster) to `main` and re-run |
+| Deploy times out at "Wait for generated Application" | ApplicationSet template error, or the cluster Secret wasn't labelled | The step prints the ApplicationSet's conditions; also check `argocd appset get eks-argocd` and the label/annotation query in [ApplicationSet](#applicationset) |
 | ArgoCD sync succeeds but tags don't appear in pods | Operator hasn't propagated to the child CR yet, or the pods haven't rolled | Wait ~1 min; if stuck, restart the operator |
 
 For any Falcon-operator-side issue the definitive log is:
