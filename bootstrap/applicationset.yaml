@@ -1,0 +1,52 @@
+# One Application per clusters/<cluster-name>/<app-name>/ directory, for every
+# ArgoCD-registered cluster that is opted in with the label eks-argocd/enabled=true.
+#
+# <cluster-name> must match the cluster's registered name in ArgoCD
+# (`argocd cluster list`). The deploy workflow adds the label; the teardown
+# workflow removes it, which makes the ApplicationSet delete that cluster's
+# Applications without touching the other clusters.
+#
+# Applied by .github/workflows/deploy-falcon.yaml; not synced by ArgoCD itself.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: eks-argocd
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          - clusters:
+              selector:
+                matchLabels:
+                  eks-argocd/enabled: "true"
+          - git:
+              repoURL: https://github.com/falconcrwd/eks-argocd
+              revision: main
+              directories:
+                - path: 'clusters/{{.name}}/*'
+  template:
+    metadata:
+      name: '{{.name}}-{{.path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/falconcrwd/eks-argocd
+        targetRevision: main
+        path: '{{.path.path}}'
+      destination:
+        server: '{{.server}}'
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+  syncPolicy:
+    # When a cluster is un-labelled or its directory is removed from Git, delete
+    # the Application but leave its resources (e.g. the FalconDeployment) in
+    # place. Teardown deletes those explicitly, in operator-safe order.
+    preserveResourcesOnDeletion: true

@@ -52,8 +52,20 @@ This repository is a GitOps source of truth for deploying CrowdStrike's **Falcon
 
 Two workflows live in `.github/workflows/`:
 
-- **`deploy-falcon.yaml`** — bootstraps and re-syncs: installs the Falcon Operator on cluster B, creates the `falcon-secrets` Secret on first run, registers cluster B with ArgoCD, and creates/updates the ArgoCD Application.
-- **`teardown-falcon.yaml`** — reverses the above: removes the ArgoCD app, deletes the `FalconDeployment` CR (letting the operator reap child workloads via finalizers), deletes the operator manifest, and unregisters cluster B from ArgoCD.
+- **`deploy-falcon.yaml`** — bootstraps and re-syncs: installs the Falcon Operator on cluster B, creates the `falcon-secrets` Secret on first run, registers cluster B with ArgoCD, applies the `eks-argocd` ApplicationSet, and opts cluster B into it so ArgoCD generates the `jwong08-eks-cluster-falcon-operator` Application.
+- **`teardown-falcon.yaml`** — reverses the above: opts cluster B out of the ApplicationSet (which removes its Application), deletes the `FalconDeployment` CR (letting the operator reap child workloads via finalizers), deletes the operator manifest, and unregisters cluster B from ArgoCD.
+
+### ApplicationSet
+
+`bootstrap/applicationset.yaml` generates one Application per `clusters/<cluster-name>/<app-name>/` directory, for every registered cluster whose ArgoCD cluster Secret has the label `eks-argocd/enabled=true`:
+
+```
+clusters/jwong08-eks-cluster/falcon-operator/
+         └── cluster name ─┘ └─ app name ──┘
+  → Application "jwong08-eks-cluster-falcon-operator" → cluster registered as "jwong08-eks-cluster"
+```
+
+`<cluster-name>` must match the name the cluster is registered under in ArgoCD (`argocd cluster list`). Removing the label, or the directory, deletes that cluster's Application but leaves its resources running (`preserveResourcesOnDeletion: true`); teardown then removes them in operator-safe order.
 
 ## Repository layout
 
@@ -61,6 +73,9 @@ Two workflows live in `.github/workflows/`:
 .github/workflows/
 ├── deploy-falcon.yaml            # Manual bootstrap + re-sync
 └── teardown-falcon.yaml          # Manual teardown
+
+bootstrap/
+└── applicationset.yaml           # Generates one Application per clusters/<cluster>/<app>/
 
 clusters/
 └── jwong08-eks-cluster/
@@ -73,7 +88,7 @@ clusters/
 README.md                         # (this file)
 ```
 
-Only `falcondeployment.yaml` is managed by ArgoCD. The operator itself, the `falcon-secrets` Secret, and the ArgoCD cluster registration are managed by the workflow (imperatively, once) because they are prerequisites of the GitOps loop, not part of it.
+Only `falcondeployment.yaml` is managed by ArgoCD. The operator itself, the `falcon-secrets` Secret, the ArgoCD cluster registration, and the ApplicationSet are managed by the workflow (imperatively) because they are prerequisites of the GitOps loop, not part of it.
 
 ## Prerequisites
 
@@ -300,17 +315,29 @@ Once bootstrap is done, changes to `manifests/falcondeployment.yaml` are automat
 To skip the 3-minute poll for a specific change:
 
 ```bash
-argocd app get falcon-operator --refresh
+argocd app get jwong08-eks-cluster-falcon-operator --refresh
 ```
 
-The `--sync-policy automated --auto-prune --self-heal` flags mean ArgoCD will also revert any drift introduced by `kubectl edit` on the cluster within one reconciliation cycle. **Git is the source of truth for the CR.**
+The ApplicationSet's automated sync policy (`prune` + `selfHeal`) means ArgoCD will also revert any drift introduced by `kubectl edit` on the cluster within one reconciliation cycle. **Git is the source of truth for the CR.**
 
 Things that **do not** auto-update and still need a workflow run:
 
 - Bumping the Falcon Operator version (`falcon_operator_version` input)
 - Rotating Falcon API credentials (`create_secret: true` with new secret values in GitHub)
-- Changing the ArgoCD Application spec itself (repo URL, path, destination namespace)
-- Adding another target cluster
+- Changing `bootstrap/applicationset.yaml` (repo URL, revision, destination namespace, sync policy) — the workflow re-applies it
+
+### Adding another target cluster
+
+1. Add `clusters/<cluster-name>/falcon-operator/` (copy the existing directory and adjust the CR).
+2. Register the cluster with ArgoCD under that exact name and opt it in:
+
+   ```bash
+   argocd cluster add <kube-context> --name <cluster-name> --label eks-argocd/enabled=true
+   ```
+
+3. Install the Falcon Operator and create the `falcon-secrets` Secret on it. The workflows only handle `jwong08-eks-cluster` (`EKS_CLUSTER`), so do this by hand or with a copy of the workflow.
+
+The ApplicationSet then generates `<cluster-name>-falcon-operator` automatically.
 
 ## Verifying ArgoCD sync status and logs
 
@@ -318,35 +345,35 @@ All commands below run from a workstation with kube contexts for both clusters. 
 
 ### Sync status with `kubectl` (no ArgoCD login needed)
 
-The ArgoCD `Application` is a regular CR in the `argocd` namespace on cluster A:
+The ArgoCD `Application` generated by the ApplicationSet is a regular CR in the `argocd` namespace on cluster A:
 
 ```bash
 # Sync / health summary for every app
 kubectl --context jwong08-argo-cluster -n argocd get applications
 
 # One-line status: sync / health @ deployed Git revision
-kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator \
+kubectl --context jwong08-argo-cluster -n argocd get app jwong08-eks-cluster-falcon-operator \
   -o jsonpath='{.status.sync.status}{" / "}{.status.health.status}{" @ "}{.status.sync.revision}{"\n"}'
 
 # Per-resource status (should be FalconDeployment/falcon-deployment  Synced)
-kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+kubectl --context jwong08-argo-cluster -n argocd get app jwong08-eks-cluster-falcon-operator -o json \
   | jq -r '.status.resources[] | "\(.kind)/\(.name)  \(.status)  \(.health.status // "-")"'
 
 # Result of the last sync operation
-kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+kubectl --context jwong08-argo-cluster -n argocd get app jwong08-eks-cluster-falcon-operator -o json \
   | jq -r '.status.operationState | "\(.phase)  \(.finishedAt)  \(.message)"'
 
 # Error conditions (ComparisonError, SyncError, ...) — empty output means none
-kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+kubectl --context jwong08-argo-cluster -n argocd get app jwong08-eks-cluster-falcon-operator -o json \
   | jq -r '.status.conditions // [] | .[] | "\(.type): \(.message)"'
 
 # Recent sync history (id, time, short SHA)
-kubectl --context jwong08-argo-cluster -n argocd get app falcon-operator -o json \
+kubectl --context jwong08-argo-cluster -n argocd get app jwong08-eks-cluster-falcon-operator -o json \
   | jq -r '.status.history[-5:][] | "\(.id)  \(.deployedAt)  \(.revision[0:7])"'
 
 # Event timeline: OutOfSync -> sync started -> succeeded/failed
 kubectl --context jwong08-argo-cluster -n argocd get events \
-  --field-selector involvedObject.name=falcon-operator --sort-by=.lastTimestamp
+  --field-selector involvedObject.name=jwong08-eks-cluster-falcon-operator --sort-by=.lastTimestamp
 ```
 
 A healthy state is `Synced / Healthy` at the SHA of the latest commit on `main` (`git rev-parse origin/main`). If the revision lags behind `main`, ArgoCD hasn't polled yet — force a refresh (below).
@@ -365,12 +392,14 @@ argocd login localhost:8080 --username admin --insecure \
 Then:
 
 ```bash
+APP=jwong08-eks-cluster-falcon-operator
+argocd appset get eks-argocd                       # ApplicationSet, its generated apps and conditions
 argocd app list                                    # all apps, sync + health
-argocd app get falcon-operator                     # summary, conditions, per-resource status
-argocd app get falcon-operator --refresh           # re-poll Git now instead of waiting ~3 min
-argocd app diff falcon-operator                    # Git vs live; no output = in sync
-argocd app history falcon-operator                 # deployed revisions
-argocd app wait falcon-operator --sync --health --timeout 300
+argocd app get "$APP"                              # summary, conditions, per-resource status
+argocd app get "$APP" --refresh                    # re-poll Git now instead of waiting ~3 min
+argocd app diff "$APP"                             # Git vs live; no output = in sync
+argocd app history "$APP"                          # deployed revisions
+argocd app wait "$APP" --sync --health --timeout 300
 ```
 
 ### ArgoCD component logs
@@ -380,7 +409,7 @@ ArgoCD logs in JSON, so filter on the `application` field or the `level` field:
 ```bash
 # Application controller — reconciliation, auto-sync, and apply errors for this app
 kubectl --context jwong08-argo-cluster -n argocd logs statefulset/argocd-application-controller --since=1h \
-  | grep '"application":"falcon-operator"'
+  | grep '"application":"jwong08-eks-cluster-falcon-operator"'
 
 # Warnings/errors only
 kubectl --context jwong08-argo-cluster -n argocd logs statefulset/argocd-application-controller --since=24h \
@@ -429,7 +458,7 @@ If the CR is right but the sensor isn't, see the operator log at the end of [Tro
 
 The workflow enforces safe ordering:
 
-1. Delete the ArgoCD Application with `--cascade=false` → immediately stops auto-sync so nothing races.
+1. Remove the `eks-argocd/enabled` label from cluster B's ArgoCD cluster Secret → the ApplicationSet deletes the Application (leaving the CR in place), which immediately stops auto-sync so nothing races. Other opted-in clusters are untouched.
 2. `kubectl delete falcondeployment --all` across all namespaces on cluster B → operator's finalizers reap child DaemonSets, Deployments, webhooks.
 3. Wait up to 5 minutes for finalizers to finish.
 4. `kubectl delete -f https://github.com/crowdstrike/falcon-operator/releases/download/<version>/falcon-operator.yaml` → operator itself and its CRDs are removed.
@@ -448,7 +477,7 @@ Note: the SG ingress rule from §5 is **not** removed by teardown — leave it i
 | KAC and IAR deploy but no Node Sensor DaemonSet / no Container Sensor injector | The `linux-prod` sensor update policy is missing, disabled, or the API client is missing `Sensor update policies: Read` | Fix in Falcon console (§8), then `kubectl -n falcon-operator rollout restart deploy/falcon-operator-controller-manager` |
 | `FalconNodeSensor` CR shows `Pending: RequirementsNotMet` and operator logs are silent for its controller | Stuck controller work-queue after a scope change | `kubectl -n falcon-operator rollout restart deploy/falcon-operator-controller-manager` |
 | `kubectl get falconnodesensor` shows empty `FALCON SENSOR` column | Sensor image / build hasn't been resolved from the policy — often missing `Sensor Download: Read` scope | Add scope in Falcon console, then restart the operator |
-| Git push doesn't seem to reconcile | Change not on the branch ArgoCD tracks, or automated-sync backed off after a previous failure | `argocd app get falcon-operator --refresh && argocd app diff falcon-operator`; then `argocd app sync falcon-operator` if `OutOfSync` |
+| Git push doesn't seem to reconcile | Change not on the branch ArgoCD tracks, or automated-sync backed off after a previous failure | `argocd app get jwong08-eks-cluster-falcon-operator --refresh && argocd app diff jwong08-eks-cluster-falcon-operator`; then `argocd app sync jwong08-eks-cluster-falcon-operator` if `OutOfSync` |
 | ArgoCD sync succeeds but tags don't appear in pods | Operator hasn't propagated to the child CR yet, or the pods haven't rolled | Wait ~1 min; if stuck, restart the operator |
 
 For any Falcon-operator-side issue the definitive log is:
