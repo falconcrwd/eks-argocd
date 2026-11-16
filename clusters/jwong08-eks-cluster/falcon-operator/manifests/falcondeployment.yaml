@@ -39,7 +39,7 @@ spec:
       tags:
         - eks-mixed-prod
         - team/platform
-        - env-production
+        - snoopy
     node:
       # No image: field. The operator resolves the sensor image from
       # registry.crowdstrike.com using the Falcon API credentials and the
