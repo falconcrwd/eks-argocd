@@ -155,9 +155,30 @@ jobs:
           # target still resolves; argocd CLI takes the target via --context.
           kubectl config use-context argo
 
-          if argocd cluster list -o json \
-              | jq -e --arg n "$EKS_CLUSTER" '.[] | select(.name==$n)' > /dev/null; then
-            echo "cluster $EKS_CLUSTER already registered"
+          # A cluster recreated under the same name gets a new API endpoint, so
+          # a registration matching by name alone can point at a dead server.
+          EXPECTED_SERVER=$(aws eks describe-cluster \
+            --name "$EKS_CLUSTER" \
+            --region "$AWS_REGION" \
+            --query cluster.endpoint --output text)
+          REGISTERED_SERVER=$(argocd cluster list -o json \
+            | jq -r --arg n "$EKS_CLUSTER" '.[] | select(.name==$n) | .server')
+          if [ -n "$REGISTERED_SERVER" ] \
+              && [ "${REGISTERED_SERVER,,}" != "${EXPECTED_SERVER,,}" ]; then
+            echo "cluster $EKS_CLUSTER is registered at $REGISTERED_SERVER but now lives at $EXPECTED_SERVER; re-registering"
+            # Delete the cluster Secret directly: argocd cluster rm would also
+            # tear down argocd-manager RBAC via the $EKS_CLUSTER kubeconfig
+            # context, which now points at the new cluster.
+            kubectl -n argocd get secret \
+              -l argocd.argoproj.io/secret-type=cluster -o json \
+              | jq -r --arg n "$EKS_CLUSTER" --arg s "$EXPECTED_SERVER" \
+                  '.items[] | select((.data.name | @base64d) == $n and ((.data.server | @base64d | ascii_downcase) != ($s | ascii_downcase))) | .metadata.name' \
+              | xargs -r kubectl -n argocd delete secret
+            REGISTERED_SERVER=""
+          fi
+
+          if [ -n "$REGISTERED_SERVER" ]; then
+            echo "cluster $EKS_CLUSTER already registered at $REGISTERED_SERVER"
           else
             echo "registering $EKS_CLUSTER with ArgoCD"
             argocd cluster add "$EKS_CLUSTER" \
